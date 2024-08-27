@@ -1,0 +1,1658 @@
+#include "DcmImportDialog.h"
+#include <QApplication.h>
+#include <QDesktopWidget.h>
+#include <QToolTip>
+#include "PMBusinessModel.h"
+#include <QDebug>
+#include <QSettings>
+#include "DciomConvertTableInfo.h"
+#include "MTRPCTcpClientService/IMTRPCTcpClientService.h"
+#include "MtPushButton.h"
+#include "Skin/CMtSkinManager.h"
+#include "CMtWidgetManager.h"
+#include "MTCommonRpc_GetDicomDir.h"
+#include "Language.h"
+//ADD timStamp
+#include "Utils\TimeStamp\HeightPrecisionTimeStamp.h"
+static HightPrecisionTimeStamp timeStamp;
+#pragma execution_character_set("utf-8")
+
+struct LimitImportInfo
+{
+    int leftNumber = 0;
+    int currentNumber = 0;
+};
+
+DcmImportDialog::DcmImportDialog(QWidget* parent)
+    : MtTemplateDialog(parent)
+{
+    ui.setupUi(this);
+    m_sortDcmInfo = new SortDcmInfo;
+    m_sortDcmInfo->initDicomRetrieveRules();
+    init();
+    initVTKOutputLog();
+    connect(this, &DcmImportDialog::sigCSMTEventImportProcess, m_dcmInfoDialog, &DcmInfoDialog::slotCSMTEventProcess);
+    connect(ui.mtTabWidget, &MtTabWidget::currentChanged, this, &DcmImportDialog::slotCurrentChanged);
+    connect(this, &DcmImportDialog::sigCheckImageType, this, &DcmImportDialog::slotCheckImageType, Qt::BlockingQueuedConnection);
+    //任务线程里的
+    connect(this, &DcmImportDialog::sigImportProcess, m_dcmInfoDialog, &DcmInfoDialog::slotSetProcessBarValue, Qt::BlockingQueuedConnection);
+    //加载自定义qss
+    CMtSkinManager* skinManager = CMtWidgetManager::getInstance()->GetMtSkinManager();
+    QString errMsg;
+    skinManager->LoadDomainWidgetSkinStyle(this, errMsg);
+    ui.listWidget_ServerData->setStyleSheet("QListWidget::Item:hover{background:transparent;}");
+    ui.listWidget_LocalData->setStyleSheet("QListWidget::Item:hover{background:transparent;}");
+}
+
+DcmImportDialog::~DcmImportDialog()
+{
+    //1.清除服务端和客户端界面所有item
+    clearLocalTree();
+    clearServerTree();
+    SAFE_DELETE(m_sortDcmInfo)
+    SAFE_DELETE(m_dcmInfoDialog);
+}
+
+void DcmImportDialog::onBtnCloseClicked()
+{
+    this->reject();
+}
+
+void DcmImportDialog::onBtnRight2Clicked()
+{
+    this->reject();
+}
+
+void DcmImportDialog::onBtnRight1Clicked()
+{
+    timeStamp.Update();
+    qDebug() << "[Time Consume Start] Import dicom";
+    std::map<std::string, ImportPatientData> patientImportMap;
+    QMap<ImportPatientItem*, ImportPatientItemTree*>& importSelectMap =
+        (ui.mtTabWidget->currentIndex() == DcmImportDialog::ImportPage_Local) ? m_localItemTreeMap : m_serverItemTreeMap;
+
+    for (QMap<ImportPatientItem*, ImportPatientItemTree*>::const_iterator iter = importSelectMap.begin(); iter != importSelectMap.end(); ++iter)
+    {
+        ImportPatientItem* paitentItem = iter.key();
+        ImportPatientItemTree* treeItem = iter.value();
+
+        if (paitentItem->GetCheckStatus() == true)
+        {
+            std::string patientID = paitentItem->GetPatientID().toStdString();
+            std::vector<DcmAllInfo> dicomInfoVec = treeItem->GetSelectFiles();
+
+            if (dicomInfoVec.size() != 0)
+            {
+                std::map<std::string, ImportPatientData> oneItemPatient;
+                m_sortDcmInfo->sortDcmInfoByPatientID(dicomInfoVec, oneItemPatient);
+                patientImportMap.insert(oneItemPatient.begin(), oneItemPatient.end());
+            }
+        }
+    }
+
+    if (patientImportMap.size() == 0)
+    {
+        MtMessageBox::NoIcon::information_Title(this, tr("请选择要导入的文件。"));
+        return;
+    }
+
+    //检查本次导入选择图像是否超过了1幅
+    if (importJudgeOneSeriesLimit(patientImportMap) == false)
+    {
+        return;
+    }
+
+    //检查本次导入选择Dose是否超过了1幅
+    if (importJudgeOneDoseLimit(patientImportMap) == false)
+    {
+        return;
+    }
+
+    //检查图像在系统里是否超过了10幅
+    if (importJudgeImageLimit(patientImportMap) == false)
+    {
+        return;
+    }
+
+    //检测该患者是否被打开
+    if (importJudgePatientOpened(patientImportMap) == false)
+    {
+        return;
+    }
+
+    //警告用户导入确认是否正常文件
+    /*if (importSelectPatientJudge() == false)
+    {
+        return;
+    }*/
+    //最后一步检测图像正常性。
+    importJudgeImageNormalType(patientImportMap);
+}
+void DcmImportDialog::DeleteImportPatientData()
+{
+    //因为每次导入一个患者数据，单独判断即可
+    QMap<QString, ImportStudyResult>& studyData = m_importResultMap.begin().value().studyMap;
+    //------------------------------------删除CT------------------------------
+    QMap<QString, ImportSeriesResult>& seriesData = studyData.begin().value().seriesMap;
+    QString seriesPath = seriesData.begin().value().seriesDirPath;
+    seriesPath.remove(seriesPath.size() - 1, 1);
+
+    if (seriesData.begin().value().status == IMPORT_SUCCESS)
+    {
+        FileOperationUtils::DeletTargetFolder(seriesPath);
+    }
+
+    //------------------------------------删除CTEND------------------------------
+    //------------------------------------删除RtStruct---------------------------
+    QMap<QString, ImportRTStructResult>& rtStructData = seriesData.begin().value().rtMap;
+
+    //多份RtStruct删除
+    for (auto& rtStructTmp : rtStructData)
+    {
+        QString rtStructPath = rtStructTmp.rtStructDirPath;
+        rtStructPath.remove(rtStructPath.size() - 1, 1);
+
+        if (rtStructTmp.status == IMPORT_SUCCESS)
+        {
+            FileOperationUtils::DeletTargetFolder(rtStructPath);
+        }
+    }
+
+    //------------------------------------删除RtStructEND---------------------------
+    //------------------------------------删除RtPlan-------------------------------
+    for (auto& rtStructTmp : rtStructData)
+    {
+        QMap<QString, ImportRTPlanResult>& rtPlanData = rtStructTmp.planMap;
+
+        //多份RtPlan删除
+        for (auto& rtPlanTmp : rtPlanData)
+        {
+            QString rtPlanPath = rtPlanTmp.rtPlanDirPath;
+            rtPlanPath.remove(rtPlanPath.size() - 1, 1);
+
+            if (rtPlanTmp.status == IMPORT_SUCCESS)
+            {
+                FileOperationUtils::DeletTargetFolder(rtPlanPath);
+            }
+        }
+
+        //-------------------------------------删除RtPlanEND-------------------------------
+        //-------------------------------------删除RtDose-----------------------------
+        for (auto& rtPlanTmp : rtPlanData)
+        {
+            QMap<QString, ImportRTDoseResult> rtDoseData = rtPlanTmp.doseMap;
+
+            if (rtDoseData.size() == 0)
+            {
+                continue;
+            }
+
+            //RtDose一份
+            QString rtDosePath = rtDoseData.begin().value().rtDoseDirPath;
+            rtDosePath.remove(rtDosePath.size() - 1, 1);
+
+            if (rtDoseData.begin().value().status == IMPORT_SUCCESS)
+            {
+                FileOperationUtils::DeletTargetFolder(rtDosePath);
+            }
+        }
+    }
+
+//-------------------------------------删除RtDoseEND-----------------------------
+}
+
+void DcmImportDialog::on_btnFile_clicked()
+{
+    QFileDialog fielChoose;
+    fielChoose.resize(240, 320);
+    fielChoose.setViewMode(QFileDialog::List);
+    QString filePath = fielChoose.getExistingDirectory();
+    fielChoose.close();
+
+    if (filePath.isEmpty())
+    {
+        return;
+    }
+
+    //清空上一次的树
+    clearLocalTree();
+    ui.lineEdit_search->setText(filePath);
+    ui.lineEdit_search->setCursorPosition(0);
+    //异步检索文件夹
+    std::map<std::string, ImportPatientData> localPatientMap; //检索的数据
+    parsePatientDicom(filePath, localPatientMap);
+    m_dcmInfoDialog->setProcessMode(tr("文件检索中"), false, true);
+
+    if (m_dcmInfoDialog->exec() == QDialog::Accepted)
+    {
+        reflashLocalTree(localPatientMap);
+    }
+}
+void DcmImportDialog::slotCurrentChanged(int index)
+{
+    if (index == ImportPage::ImportPage_Server)
+    {
+        if (m_firstLoad == true)
+        {
+            //解析远程目录
+            reflashServerTree();
+            m_firstLoad = false;
+        }
+    }
+}
+void DcmImportDialog::slotLocalPatientChanged()
+{
+    ImportPatientItem* item = qobject_cast<ImportPatientItem*>(sender());
+    bool checkStatus = item->GetCheckStatus();
+
+    if (checkStatus == true && m_localItemTreeMap.contains(item) == false)
+    {
+        //插入树形图
+        int aa = ui.listWidget_LocalData->count();
+        QListWidgetItem* treeItem = new QListWidgetItem();
+        ImportPatientItemTree* newItemTree = new ImportPatientItemTree;
+        newItemTree->CreateFileTree(m_localItemDataMap.value(item));
+        newItemTree->SetAllItemCheckStatus(true);
+        QSize itemSize = QSize(ui.listWidget_LocalData->width() - 6, newItemTree->height());
+        ui.listWidget_LocalData->addItem(treeItem);
+        ui.listWidget_LocalData->setItemWidget(treeItem, newItemTree);
+        treeItem->setSizeHint(itemSize);
+        //绑定全不选信号
+        connect(newItemTree, &ImportPatientItemTree::SigCancelSelect, item, &ImportPatientItem::SigCheckStuatusChanged);
+        //加入内存映射
+        m_localItemTreeMap.insert(item, newItemTree);
+    }
+    else
+    {
+        //全部不选的时候，主动取消
+        if (item->GetCheckStatus())
+        {
+            item->SetCheckStatus(false, false);
+        }
+
+        ImportPatientItemTree* delItemTree = m_localItemTreeMap.value(item);
+        m_localItemTreeMap.remove(item);
+        int counter = ui.listWidget_LocalData->count();
+
+        for (int index = 0; index < counter; index++)
+        {
+            QListWidgetItem* tempItem = ui.listWidget_LocalData->item(index);
+            ImportPatientItemTree* widget = (ImportPatientItemTree*)ui.listWidget_LocalData->itemWidget(tempItem);
+
+            if (widget == delItemTree)
+            {
+                //移除这个树形图节点
+                ui.listWidget_LocalData->removeItemWidget(tempItem);
+                ui.listWidget_LocalData->takeItem(index);
+                SAFE_DELETE(tempItem);
+
+                if (widget)
+                {
+                    widget->deleteLater();
+                }
+
+                //SAFE_DELETE(widget);
+                break;
+            }
+        }
+    }
+}
+void DcmImportDialog::slotServerPatientChanged()
+{
+    ImportPatientItem* item = qobject_cast<ImportPatientItem*>(sender());
+    bool checkStatus = item->GetCheckStatus();
+
+    if (checkStatus == true && m_serverItemTreeMap.contains(item) == false)
+    {
+        //1.检查是否存在内存数据,不存在执行检索文件夹，并且加入内存数据
+        if (m_serverItemDataMap.contains(item) == false)
+        {
+            //检索
+            QString dicomDirPath = item->GetPatientDirPath();
+            m_dcmInfoDialog->setProcessMode(tr("文件检索中"), false, true);
+            std::map<std::string, ImportPatientData> serverPatientMap; //检索的数据
+            parsePatientDicom(dicomDirPath, serverPatientMap);
+
+            if (m_dcmInfoDialog->exec() != QDialog::Accepted)
+            {
+                item->SetCheckStatus(false, false);
+                return;
+            }
+
+            //加入内存
+            m_serverItemDataMap.insert(item, serverPatientMap.begin()->second);
+        }
+
+        //2.从内存取出数据刷新树形图
+        ImportPatientData importData =  m_serverItemDataMap.value(item);
+        //插入树形图
+        int aa = ui.listWidget_ServerData->count();
+        QListWidgetItem* treeItem = new QListWidgetItem();
+        ImportPatientItemTree* newItemTree = new ImportPatientItemTree;
+        ui.listWidget_ServerData->addItem(treeItem);
+        ui.listWidget_ServerData->setItemWidget(treeItem, newItemTree);
+        newItemTree->CreateFileTree(importData);
+        newItemTree->SetAllItemCheckStatus(true);
+        treeItem->setSizeHint(QSize(ui.listWidget_ServerData->width() - 6, newItemTree->height()));
+        //绑定全不选信号
+        connect(newItemTree, &ImportPatientItemTree::SigCancelSelect, item, &ImportPatientItem::SigCheckStuatusChanged);
+        //加入内存映射
+        m_serverItemTreeMap.insert(item, newItemTree);
+    }
+    else
+    {
+        //全部不选的时候，主动取消
+        if (item->GetCheckStatus())
+        {
+            item->SetCheckStatus(false, false);
+        }
+
+        //删除树形图
+        ImportPatientItemTree* delItemTree = m_serverItemTreeMap.value(item);
+        m_serverItemTreeMap.remove(item);
+        int counter = ui.listWidget_ServerData->count();
+
+        for (int index = 0; index < counter; index++)
+        {
+            QListWidgetItem* tempItem = ui.listWidget_ServerData->item(index);
+            ImportPatientItemTree* widget = (ImportPatientItemTree*)ui.listWidget_ServerData->itemWidget(tempItem);
+
+            if (widget == delItemTree)
+            {
+                //移除这个树形图节点
+                ui.listWidget_LocalData->removeItemWidget(tempItem);
+                ui.listWidget_ServerData->takeItem(index);
+                SAFE_DELETE(tempItem);
+
+                //SAFE_DELETE(widget);
+                if (widget)
+                {
+                    widget->deleteLater();
+                }
+
+                break;
+            }
+        }
+    }
+}
+void DcmImportDialog::slotPatientCancelSelect()
+{
+}
+void DcmImportDialog::slotSetResultMode(bool isSuccess, QString showTitle, QString showMsg)
+{
+    m_dcmInfoDialog->setResultMode(isSuccess, showTitle, showMsg);
+
+    if (isSuccess)
+    {
+        this->accept();
+    }
+    else
+    {
+        this->reject();
+    }
+}
+void DcmImportDialog::slotImportResultList(QMap<QString, ImportPatientResult> importResultMap)
+{
+    double time = timeStamp.GetElapsedTimeInMilliSec();
+    qDebug() << "[Time Consume End] Import dicom: " << time << " ms";
+    m_importResultMap = importResultMap;
+    m_dcmInfoDialog->accept();
+    ImportResultTree importResultDlg(PMBusinessModel::getInstance()->GetMainWidget());//导入结果
+    importResultDlg.UpdateTreeFromData(importResultMap);
+
+    if (ui.mtCheckBox->isChecked())
+    {
+        DeleteImportPatientData();
+    }
+
+    while (true)
+    {
+        if (importResultDlg.exec() != QDialog::Accepted)
+        {
+            return;
+        }
+
+        mtrpcdicom::ST_MTRPC_REQ_DicomImport_ModifySeries modifySeries = importResultDlg.GetModifyInfo();
+        //发送到服务端进行修改摆位/机器/图像类型
+        QString serverIP;
+        int serverPort;
+        QString clientID;
+        QString tempMsg;
+        PMBusinessModel::getInstance()->GetServerIPAndPort_ClientID(serverIP, serverPort, clientID, tempMsg);
+        mtrpc::RpcTcpClient client(serverIP.toStdString(), serverPort);
+        std::string tmp;
+        int ret = client.InitClient(tmp);
+
+        if (ret != 0)
+        {
+            MtMessageBox::yellowWarning(this, tr("RpcTcpClient初始化失败"));
+            return;
+        }
+
+        PMBusinessModel::getInstance()->ShowLoadingDialog(tr("患者校验信息更新中..."));
+        std::string errMsgStr;
+        std::string responseStr;
+        client.SetRpcTimeout(0);
+        //请求导入，子线程
+        QEventLoop eventLoop;
+        mtcore::MTTask task = [&]()
+        {
+            mtrpcdicom::ST_MTRPC_REQ_DicomImport req_data;
+            req_data.importType = mtrpcdicom::ST_MTRPC_REQ_DicomImport::EM_ImportType::ModifySeries;
+            req_data.modifySeries = modifySeries;
+            //
+            mtrpcdicom::ST_MTRPC_REQ_DicomCommon req_common;
+            req_common.id = 1;
+            req_common.method = "ExecuteDicomOperation";
+            req_common.clientID = clientID.toStdString();
+            req_common.param = req_data.ConvertJson();
+            ret = client.RpcMethod(req_common.ConvertJson(), responseStr, errMsgStr);
+            eventLoop.quit();
+        };
+        PMBusinessModel::getInstance()->GetMTContext()->AddTask(task);
+        eventLoop.exec();
+        mtrpcdicom::ST_MTRPC_RES_DicomCommon res_common;
+        res_common.ConvertData(responseStr);
+        PMBusinessModel::getInstance()->HideLoadingDialog();
+
+        //如果万一正好遇到其他客户端又在导入或者编辑删除，需要等待则回头重试
+        if (res_common.code == 80021)
+        {
+            MtMessageBox::yellowWarning(this, tr("其他客户端正在对该患者数据进行操作，请重试"));
+            continue;
+        }
+
+        if (ret != 0 || res_common.code != 0)
+        {
+            MtMessageBox::yellowWarning(this, tr("修改患者数据异常"), (ret != 0) ? errMsgStr.c_str() : res_common.message.c_str());
+        }
+
+        break;
+    }
+}
+void DcmImportDialog::slotCheckImageType(bool parseOK, bool isCheckOK, QString errTypeMsg, std::map<std::string, ImportPatientData> patientImportMap)
+{
+    PMBusinessModel::getInstance()->HideLoadingDialog();
+
+    if (parseOK == false)
+    {
+        MtMessageBox::yellowWarning(this, tr("导入失败"), errTypeMsg);
+        return;
+    }
+
+    if (isCheckOK == false)
+    {
+        if (MtMessageBox::redWarning_YesOnLeft(this,  errTypeMsg, tr(""), tr("忽略")) != QMessageBox::Yes)
+        {
+            return;
+        }
+    }
+
+    this->hide();
+    //执行本地导入
+    m_dcmInfoDialog->setProcessMode(tr("导入数据中"), true);
+    importLocalFiles(patientImportMap);
+    m_dcmInfoDialog->exec();
+    clearLocalTree();
+    this->accept();
+}
+void DcmImportDialog::parsePatientDicom(QString& dicomFilePath, std::map<std::string, ImportPatientData>& patientMap)
+{
+    mtcore::MTTask task = [&]
+    {
+
+        std::vector<DcmAllInfo> errDicomVec;
+        QByteArray temp = dicomFilePath.toLocal8Bit(); //解决中文
+        std::string newFilepath = temp.data();
+
+        int count = 0;
+
+        std::vector<DcmAllInfo> allDicomInfo;
+        bool isNormalParse = PMBusinessModel::getInstance()->parseDicomFiles(newFilepath, allDicomInfo, std::vector<std::string>(), errDicomVec,
+                true, MDcmParse::PARSE_COMMON_AND_SPECIFIC_INFO, [&](size_t total, std::string fileName, int retCode, manteia::MExceptionOut errOut)
+        {
+            ++count;
+            int percent = ((float)count / (float)total) * 100;
+            emit sigParseProgressValue(percent);
+        });
+
+        //被取消了
+        if (isNormalParse == false)
+        {
+            emit sigPraseDicomCancel_Main();
+            return;
+        }
+
+        emit sigParseProgressValue(100);
+        //检索失败，检索不到dicom文件或者有错误文件无法导入，弹窗提示选择取消或继续导入
+        if (allDicomInfo.empty())
+        {
+            emit sigPraseDicomEmpty();
+            return;
+        }
+
+        //屏蔽胸透图
+        for (std::vector<DcmAllInfo>::iterator iter = allDicomInfo.begin(); iter != allDicomInfo.end();)
+
+        {
+            bool isEarseIt = false;;
+
+            if (3 == iter->imageType.size())
+            {
+                QString imageType = iter->imageType[2].c_str();
+
+                if (0 == imageType.compare("LOCALIZER", Qt::CaseInsensitive))
+                {
+                    isEarseIt = true;
+                }
+            }
+
+            //屏蔽空数据
+            if (iter->sopInsUID.size() == 0 || iter->patientID.size() == 0)
+            {
+                isEarseIt = true;
+            }
+
+            if (isEarseIt)
+            {
+                iter = allDicomInfo.erase(iter);
+            }
+            else
+            {
+                ++iter;
+            }
+        }
+
+        //排序规整dicom
+        m_sortDcmInfo->sortDcmInfoByPatientID(allDicomInfo, patientMap);
+
+        emit sigImportAccepted();
+    };
+    PMBusinessModel::getInstance()->GetMTContext()->AddTask(task);
+}
+void DcmImportDialog::importLocalFiles(std::map<std::string, ImportPatientData> importMap)
+{
+    QString serverIP;
+    int serverPort;
+    QString clientID;
+    QString tempMsg;
+
+    if (PMBusinessModel::getInstance()->GetServerIPAndPort_ClientID(serverIP, serverPort, clientID, tempMsg) == false)
+    {
+        emit sigImportResult(false, tr("患者数据导入失败"), tempMsg);
+        return;
+    }
+
+    bool isRemoteImport = (ui.mtTabWidget->currentIndex() == DcmImportDialog::ImportPage_Server);
+    mtcore::MTTask importTask = [ = ]()
+    {
+        //获取流程数据。看当前打开的图像是否有RT。有的话提前筛掉。防止新建的RT还没保存就导入
+        ProcessDataStream* processDataStream = PMBusinessModel::getInstance()->GetProcessDataStream();
+        /*开始输出调试信息......*/
+        QTime ImportFuncTime;
+        ImportFuncTime.start();
+        //
+        mtrpc::RpcTcpClient client(serverIP.toStdString(), serverPort);
+        std::string tmp;
+        int ret = client.InitClient(tmp);
+
+        if (ret != 0)
+        {
+            emit sigImportResult(false, tr("患者数据导入失败"), QString(tr("RpcTcpClient初始化失败")));
+            return;
+        }
+
+        /*输出调试信息......*/
+        qDebug() << QString("ImportTime RpcTcpClient InitClient:%1 ms").arg(QString::number(ImportFuncTime.elapsed()));
+        ImportFuncTime.restart();
+        /*输出调试信息......*/
+        //1.获取临时导入的文件夹
+        mtrpccommon::ST_MTRPC_REQ_GetDicomDir query;
+        mtrpccommon::ST_MTRPC_RES_GetDicomDir response;
+        query.method = "GetTPSDicomTempOperationDir";
+        std::string responseDirStr;
+        //发送数据
+        std::string errMsgStr;
+        client.SetRpcTimeout(3000);
+        //请求导入
+        ret = client.RpcMethod(query.ConvertJson(), responseDirStr, errMsgStr);
+        response.ConvertData(responseDirStr);
+        QString forntDirPath = response.dir.c_str();
+
+        if (FileOperationUtils::GetDirisExist(forntDirPath) == false)
+        {
+            emit sigImportResult(false,  QString(tr("临时导入文件夹不存在")), forntDirPath);
+            return;
+        }
+
+        /*输出调试信息......*/
+        qDebug() << QString("ImportTime RpcTcpClient RpcMethod(GetTPSDicomTempOperationDir):%1 ms").arg(QString::number(ImportFuncTime.elapsed()));
+        ImportFuncTime.restart();
+        /*输出调试信息......*/
+        //所有的患者导入数据状态记录
+        QMap<QString, ImportPatientResult> importResultMap;
+        //开始组装数据
+        mtrpcdicom::ST_MTRPC_REQ_DicomImport req_data;
+        QVector<QString> importPatientDirVec;//导入成功后删除目录
+        QString errMsg;
+        //导入进度，主要时间花费在CT/RT的预加载数据上，所以客户端占80%进度，剩下20%服务端发
+        int totalImportSize = 0;
+
+        for (auto iter = importMap.begin(); iter != importMap.end(); iter++)
+        {
+            ImportPatientData onePatientData = iter->second;
+            totalImportSize += onePatientData.getTotalFileCount();
+        }
+
+        /*输出调试信息......*/
+        qDebug() << QString("ImportTime TotalSize:%1 ").arg(QString::number(totalImportSize));
+        /*输出调试信息......*/
+        int importCount = 1;
+        float onceImportValue = totalImportSize > 0 ? (80.0 / totalImportSize) : 0;
+
+        //1.把所有的文件按病人ID分文件夹拷贝给服务端的共享目录
+        for (auto iter = importMap.begin(); iter != importMap.end(); iter++)
+        {
+            mtrpcdicom::ST_MTRPC_REQ_DicomImport_Patient oneImportPatient;
+            QString patientID = iter->first.c_str();
+            ImportPatientData onePatientData = iter->second;
+            std::map<std::string/*studyUID*/, ImportStudyData> studyDataMap = onePatientData.getStudyData();
+            //以clientID+patientID命名文件夹确保唯一性
+            QString patientDir = forntDirPath + QString("import_%1_%2").arg(clientID).arg(patientID)  + "/";
+            //结果数据
+            ImportPatientResult onePatientResult(patientID);
+            onePatientResult.patientName = onePatientData.getPatientInfo().getPatientName().c_str();
+
+            if (!TPSFileSystemUtil::tryCreateDir(patientDir))
+            {
+                //记录这个病人无法创建临时文件夹，整个病人失败
+                onePatientResult.addResultData(IMPORT_FAILED, "", QString("Create temp import patient folder Failed."));
+                importResultMap.insert(patientID, onePatientResult);
+                continue;
+            }
+
+            QString oneTablePatientJson = patientDir + QString("%1_patient.tmp").arg(patientID);
+            importPatientDirVec.push_back(patientDir);
+
+            //开始按病人来
+            for (auto studyIter = studyDataMap.begin(); studyIter != studyDataMap.end(); ++studyIter)
+            {
+                QString sutdyUID = studyIter->first.c_str();
+                ImportStudyData oneStudyData = studyIter->second;
+                std::map<std::string/*seriesUID*/, ImportSeriesData> seriesDataMap = oneStudyData.getSeriesData();
+                QString oneTableStudyJson = patientDir + QString("%1_study.tmp").arg(sutdyUID);
+                //result
+                ImportStudyResult oneStudyResult(sutdyUID);
+                oneStudyResult.studyID = oneStudyData.getStudyInfo().getStudyID().c_str();
+
+                //1.遍历序列
+                for (auto imageIter = seriesDataMap.begin(); imageIter != seriesDataMap.end(); ++imageIter)
+                {
+                    mtrpcdicom::ST_MTRPC_REQ_DicomImport_Series oneSeriesObj;
+                    //
+                    QString seriesUID = imageIter->first.c_str();
+                    ImportSeriesData oneSeries = imageIter->second;
+                    std::vector<DcmAllInfo> allSeriesVec = oneSeries.getDicomAllInfo();
+                    DcmAllInfo allSeriesInfo = allSeriesVec.at(0);
+                    //创建series目录
+                    QString  oneSeriesDir = patientDir + seriesUID + "/";
+                    //图像结果
+                    ImportSeriesResult oneSeriesResult(seriesUID);
+                    oneSeriesResult.modality = allSeriesInfo.modality.c_str();
+                    oneSeriesResult.seriesFileCount = QString::number(allSeriesVec.size());
+                    oneSeriesResult.seriesDirPath = FileOperationUtils::GetFileExistDir(QString::fromLocal8Bit(allSeriesInfo.filePath.c_str()));//中文乱码
+                    oneSeriesResult.imagePosition = allSeriesInfo.patientPositon.c_str();
+                    oneSeriesResult.manufactor = allSeriesInfo.manufacturer.c_str();
+                    oneSeriesResult.manufactorModelName = allSeriesInfo.manufacturerModelName.c_str();
+
+                    //图像类型
+                    if (m_imageTypeMap.contains(seriesUID))
+                    {
+                        oneSeriesResult.imageType = m_imageTypeMap.value(seriesUID);
+                    }
+
+                    //2.生成nii+json
+                    QString  oneSeriesNii = oneSeriesDir + QString("dcm_image.nii");
+                    QString  oneSeriesJson = oneSeriesDir + QString("dcm_info.json");
+                    QString oneThumbnail = oneSeriesDir + QString("%1.jpg").arg(seriesUID);
+                    /*输出调试信息......*/
+                    qDebug() << QString("ImportTime Series begin.SeriesUID:%1").arg(seriesUID);
+                    ImportFuncTime.restart();
+
+                    /*输出调试信息......*/
+                    do
+                    {
+                        if (TPSFileSystemUtil::tryCreateDir(oneSeriesDir) == false)
+                        {
+                            //记录序列失败
+                            oneSeriesResult.addResultData(IMPORT_FAILED, "", QString("Create temp import series folder failed."));
+                            break;
+                        }
+
+                        //1.复制所有的dicom文件到文件夹
+                        for (int seriesIndex = 0; seriesIndex < allSeriesVec.size(); ++seriesIndex)
+                        {
+                            QString dstImageDcm = oneSeriesDir + allSeriesVec[seriesIndex].modality.c_str() + "." + allSeriesVec[seriesIndex].sopInsUID.c_str() + ".dcm";
+                            QString tempCTPath = QString::fromLocal8Bit(allSeriesVec[seriesIndex].filePath.c_str());//解决中文路径
+                            FileOperationUtils::CopyFiletoDestination(tempCTPath, dstImageDcm);
+                        }
+
+                        if (PMBusinessModel::getInstance()->ExcuteDicomImageToNii(allSeriesInfo.seriesUID.c_str(),
+                                oneSeriesDir, oneSeriesNii, oneSeriesJson, oneThumbnail, errMsg) == false)
+                        {
+                            //记录序列失败
+                            oneSeriesResult.addResultData(IMPORT_FAILED, "", QString("Excute dicom to nii failed,") + errMsg);
+                            break;
+                        }
+
+                        //3.生成ini记录字段
+
+                        if (QFile::exists(oneTablePatientJson) == false) //一个  病人json只生成一次
+                        {
+                            DciomConvertTableInfo::GetTablePatientDataJson(allSeriesInfo, oneTablePatientJson, errMsg);
+                        }
+
+                        oneImportPatient.patientID = patientID.toStdString();
+                        oneImportPatient.patientTableJson = oneTablePatientJson.toStdString();
+
+                        if (QFile::exists(oneTableStudyJson) == false)//一个study json只生成一次
+                        {
+                            DciomConvertTableInfo::GetTableStudyDataJson(allSeriesInfo, oneTableStudyJson, errMsg);
+                        }
+
+                        QString oneTableSeriesJson = patientDir + QString("%1_series.tmp").arg(seriesUID);
+                        QString oneTableImageJson = patientDir + QString("%1_image.tmp").arg(seriesUID);
+                        DciomConvertTableInfo::GetTableSeriesDataJson(allSeriesVec, oneTableSeriesJson, oneTableImageJson, errMsg);
+                        //4.报文记录添加
+                        oneSeriesObj.seriesUID = seriesUID.toStdString();
+                        oneSeriesObj.seriesDir = oneSeriesDir.toStdString();
+                        oneSeriesObj.seriesTableJson = oneTableSeriesJson.toStdString();
+                        oneSeriesObj.imageTableJson = oneTableImageJson.toStdString();
+                        oneSeriesObj.studyTableJson = oneTableStudyJson.toStdString();
+                    }
+                    while (0);
+
+                    /*输出调试信息......*/
+                    qDebug() << QString("ImportTime Series end.Time:%1 ms SeriesUID:%2").arg(QString::number(ImportFuncTime.elapsed())).arg(seriesUID);
+                    /*输出调试信息......*/
+                    //进度
+                    sendImportProcess(importCount++*onceImportValue);
+                    //2.开始遍历rt
+                    std::map<std::string/*sopInsUID*/, ImportRtStructData> rtDataMap = oneSeries.getRtStructData();
+
+                    for (auto rtStructIter = rtDataMap.begin(); rtStructIter != rtDataMap.end(); ++rtStructIter)
+                    {
+                        mtrpcdicom::ST_MTRPC_REQ_DicomImport_Structure oneRtStructObj;
+                        //
+                        QString rtSopInsUID = rtStructIter->first.c_str();
+                        ImportRtStructData oneRTStruct = rtStructIter->second;
+                        DcmAllInfo DcmStructInfo = oneRTStruct.getDicomAllInfo().at(0);
+                        //勾画结果
+                        ImportRTStructResult oneRTStructResult(rtSopInsUID);
+                        oneRTStructResult.rtStructDirPath = FileOperationUtils::GetFileExistDir(DcmStructInfo.filePath.c_str());
+                        /*输出调试信息......*/
+                        qDebug() << QString("ImportTime RTStruct begin.UID:%1").arg(rtSopInsUID);
+                        ImportFuncTime.restart();
+
+                        /*输出调试信息......*/
+                        do
+                        {
+                            if (oneSeriesResult.status == IMPORT_FAILED)
+                            {
+                                oneRTStructResult.addResultData(IMPORT_FAILED, "", QString("Parent series failed."));
+                                break;
+                            }
+
+                            //1.生成nii+json到patientDir
+                            QString rtSourceFile = QString::fromLocal8Bit(DcmStructInfo.filePath.c_str());//解决中文路径
+
+                            if (PMBusinessModel::getInstance()->ExcuteRTStructureToNii
+                                (DcmStructInfo.sopInsUID.c_str(), rtSourceFile, oneSeriesNii, patientDir, errMsg) == false)
+                            {
+                                oneRTStructResult.addResultData(IMPORT_FAILED, "", QString("Excute structure to nii failed,") + errMsg);
+                                break;
+                            }
+
+                            QString  oneRtStructDir = patientDir + QString("%1/").arg(rtSopInsUID);
+                            //2.生成ini记录字段
+                            QString oneTableRtStructJson = patientDir + QString("%1_rtStruct.tmp").arg(rtSopInsUID);
+                            DciomConvertTableInfo::GetTableStructDataJson(DcmStructInfo, oneTableRtStructJson, errMsg);
+                            //3.报文记录添加
+                            oneRtStructObj.sopInsUID = rtSopInsUID.toStdString();
+                            oneRtStructObj.structDir = oneRtStructDir.toStdString();
+                            oneRtStructObj.structTableJson = oneTableRtStructJson.toStdString();
+                        }
+                        while (0);
+
+                        /*输出调试信息......*/
+                        qDebug() << QString("ImportTime RTStruct end.Time:%1 ms UID:%2").arg(QString::number(ImportFuncTime.elapsed())).arg(rtSopInsUID);
+                        /*输出调试信息......*/
+                        //进度
+                        sendImportProcess(importCount++*onceImportValue);
+                        //3.遍历RTPLan
+                        std::map <std::string/*sopInsUID*/, ImportRtPlanData> rtplanDataMap = oneRTStruct.getRtPlanData();
+
+                        for (auto rtPlanIter = rtplanDataMap.begin(); rtPlanIter != rtplanDataMap.end(); ++rtPlanIter)
+                        {
+                            mtrpcdicom::ST_MTRPC_REQ_DicomImport_Plan oneRtPlanObj;
+                            //
+                            QString rtPlanSopInsUID = rtPlanIter->first.c_str();
+                            ImportRtPlanData oneRTPlan = rtPlanIter->second;
+                            DcmAllInfo DcmlPlanInfo = oneRTPlan.getDicomAllInfo().at(0);
+                            //导入结果
+                            ImportRTPlanResult oneRTPlanResult(rtPlanSopInsUID);
+                            oneRTPlanResult.rtPlanDirPath = FileOperationUtils::GetFileExistDir(DcmlPlanInfo.filePath.c_str());
+
+                            do
+                            {
+                                if (oneRTStructResult.status == IMPORT_FAILED)
+                                {
+                                    oneRTPlanResult.addResultData(IMPORT_FAILED, "", QString("Parent rtstructure failed."));
+                                    break;
+                                }
+
+                                //1.复制文件到patientDir
+                                QString dstPlanDcm = patientDir + DcmlPlanInfo.modality.c_str() + "." + DcmlPlanInfo.sopInsUID.c_str() + ".dcm";
+                                QString tempPlanPath = QString::fromLocal8Bit(DcmlPlanInfo.filePath.c_str());//解决中文路径
+
+                                if (FileOperationUtils::CopyFiletoDestination(tempPlanPath, dstPlanDcm) == false)
+                                {
+                                    oneRTPlanResult.addResultData(IMPORT_FAILED, "", QString("Copy rtplan to dstfloder failed."));
+                                    break;
+                                }
+
+                                //2.生成ini记录字段
+                                QString oneTableRtPlanJson = patientDir + QString("%1_rtPlan.tmp").arg(rtPlanSopInsUID);
+                                DciomConvertTableInfo::GetTablePlanDataJson(DcmlPlanInfo, oneTableRtPlanJson, errMsg);
+                                //3.报文记录添加
+                                oneRtPlanObj.sopInsUID = rtPlanSopInsUID.toStdString();
+                                oneRtPlanObj.planFile = dstPlanDcm.toStdString();
+                                oneRtPlanObj.planTableJson = oneTableRtPlanJson.toStdString();
+                            }
+                            while (0);
+
+                            //进度
+                            sendImportProcess(importCount++*onceImportValue);
+                            //4.遍历Dose
+                            std::map<std::string/*sopInsUID*/, ImportRtDoseData> rtdosenDataMap = oneRTPlan.getRtDoseData();
+
+                            for (auto rtDoseIter = rtdosenDataMap.begin(); rtDoseIter != rtdosenDataMap.end(); ++rtDoseIter)
+                            {
+                                mtrpcdicom::ST_MTRPC_REQ_DicomImport_Dose oneRtDoseObj;
+                                //
+                                QString rtDoseSopInsUID = rtDoseIter->first.c_str();
+                                ImportRtDoseData oneRTDose = rtDoseIter->second;
+                                DcmAllInfo DcmlDoseInfo = oneRTDose.getDicomAllInfo().at(0);
+                                //导入结果
+                                ImportRTDoseResult oneRTDoseResult(rtDoseSopInsUID);
+                                oneRTDoseResult.rtDoseDirPath = FileOperationUtils::GetFileExistDir(DcmlDoseInfo.filePath.c_str());
+
+                                do
+                                {
+                                    if (oneRTPlanResult.status == IMPORT_FAILED)
+                                    {
+                                        oneRTDoseResult.addResultData(IMPORT_FAILED, "", QString("Parent rtplan failed."));
+                                        break;
+                                    }
+
+                                    //1.复制文件到patientDir
+                                    QString dstDoseDcm = patientDir + DcmlDoseInfo.modality.c_str() + "." + DcmlDoseInfo.sopInsUID.c_str() + ".dcm";
+                                    QString tempDosePath = QString::fromLocal8Bit(DcmlDoseInfo.filePath.c_str());//解决中文路径
+
+                                    if (FileOperationUtils::CopyFiletoDestination(tempDosePath, dstDoseDcm) == false)
+                                    {
+                                        oneRTDoseResult.addResultData(IMPORT_FAILED, "", QString("Copy rtdose to dstfloder failed."));
+                                        break;
+                                    }
+
+                                    //2.生成ini记录字段
+                                    QString oneTableRtDoseJson = patientDir + QString("%1_rtDose.tmp").arg(rtDoseSopInsUID);
+                                    DciomConvertTableInfo::GetTableDoseDataJson(DcmlDoseInfo, oneTableRtDoseJson, errMsg);
+                                    //3.报文记录添加
+                                    oneRtDoseObj.sopInsUID = rtDoseSopInsUID.toStdString();
+                                    oneRtDoseObj.doseFile = dstDoseDcm.toStdString();
+                                    oneRtDoseObj.doseTableJson = oneTableRtDoseJson.toStdString();
+                                }
+                                while (0);
+
+                                oneRTPlanResult.doseMap.insert(rtDoseSopInsUID, oneRTDoseResult);
+                                oneRTDoseResult.status == IMPORT_SUCCESS ?   oneRtPlanObj.doseVec.push_back(oneRtDoseObj) : 0;
+                                //进度
+                                sendImportProcess(importCount++*onceImportValue);
+                            }
+
+                            oneRTStructResult.planMap.insert(rtPlanSopInsUID, oneRTPlanResult);
+                            oneRTPlanResult.status == IMPORT_SUCCESS ? oneRtStructObj.planVec.push_back(oneRtPlanObj) : 0;
+                        }
+
+                        oneSeriesResult.rtMap.insert(rtSopInsUID, oneRTStructResult);
+                        oneRTStructResult.status == IMPORT_SUCCESS ? oneSeriesObj.structVec.push_back(oneRtStructObj) : 0;
+                    }
+
+                    oneStudyResult.seriesMap.insert(seriesUID, oneSeriesResult);
+                    oneSeriesResult.status == IMPORT_SUCCESS ? oneImportPatient.seriesVec.push_back(oneSeriesObj) : 0;
+                }
+
+                onePatientResult.studyMap.insert(sutdyUID, oneStudyResult);
+            }
+
+            importResultMap.insert(patientID, onePatientResult);
+            oneImportPatient.seriesVec.size() > 0 ? req_data.patientVec.push_back(oneImportPatient) : 0;
+        }
+
+        if (req_data.patientVec.size() == 0)
+        {
+            //删除文件夹
+            for (QString importPatientDir : importPatientDirVec)
+            {
+                FileOperationUtils::DeletTargetFolder(importPatientDir);
+            }
+
+            //如果全部出错，直接返回，并显示结果
+            PMBusinessModel::getInstance()->resetAllImportReesult(importResultMap, IMPORT_FAILED, "", QString("Import patient array is null."));
+            emit sigImportResultList(importResultMap);
+            return;
+        }
+
+        //组装患者请求结构体
+        mtrpcdicom::ST_MTRPC_REQ_DicomCommon req_common;
+        req_common.id = 1;
+        req_common.method = "ExecuteDicomOperation";
+        req_common.clientID = clientID.toStdString();
+        req_common.param = req_data.ConvertJson();
+        //qDebug() << "Dicom Import Request:" << req_common.ConvertJson().c_str();
+        //发送数据
+        std::string responseStr;
+        client.SetRpcTimeout(0);
+        //请求导入
+        ret = client.RpcMethod(req_common.ConvertJson(), responseStr, errMsgStr);
+
+        //清除临时文件夹
+        if (m_isSaveImportTempFile == false)
+        {
+            for (QString importPatientDir : importPatientDirVec)
+            {
+                FileOperationUtils::DeletTargetFolder(importPatientDir);
+            }
+        }
+
+        sendImportProcess(100);
+        //响应结构体
+        mtrpcdicom::ST_MTRPC_RES_DicomCommon res_common;
+        res_common.ConvertData(responseStr);
+        mtrpcdicom::ST_MTRPC_RES_DicomImport res_import;
+        res_import.ConvertData(res_common.param);
+        //日志处理
+        {
+            mtrpcdicom::ST_MTRPC_RES_DicomImport logInfo = res_import;
+
+            for (int i = 0; i < logInfo.patientArr.size(); ++i)
+            {
+                mtrpcdicom::ST_MTRPC_RES_DicomImport_Patient& onePatient = logInfo.patientArr[i];
+                onePatient.patientID = QString("[#%1#]").arg(onePatient.patientID.c_str()).toStdString();
+            }
+
+            qDebug() << "Import dicom response:" << logInfo.ConvertJson().c_str();
+        }
+        //合并导入结果
+        PMBusinessModel::getInstance()->mergeImportResult(importResultMap, res_import);
+        //删除成功的源文件如果是远程导入
+        /*if (isRemoteImport)
+        {
+            deleteRemoteImportSourceFile(importResultMap);
+        }*/
+        PMBusinessModel::getInstance()->CopyThumbnailToDst(importResultMap);
+        emit sigImportResultList(importResultMap);
+    };
+    PMBusinessModel::getInstance()->GetMTContext()->AddTask(importTask);
+}
+QMap<QString, ImportPatientResult> DcmImportDialog::getImportResultMap()
+{
+    return m_importResultMap;
+}
+void DcmImportDialog::RefreshTreeWidget()
+{
+    for (int i = 0; i < m_remoteImportPatientInfoList.size(); ++i)
+    {
+        QListWidgetItem* item = ui.listWidget_ServerPatient->item(i);
+        ImportPatientItem* itemWidget = dynamic_cast<ImportPatientItem*>(ui.listWidget_ServerPatient->itemWidget(item));
+        item->setHidden(false);
+
+        if (itemWidget->GetCheckStatus())
+        {
+            itemWidget->SetCheckStatus(false);
+            emit itemWidget->SigCheckStuatusChanged();
+        }
+    }
+}
+void DcmImportDialog::init()
+{
+    //去除标题栏
+    m_dcmInfoDialog = new DcmInfoDialog(this);
+    connect(this, &DcmImportDialog::sigPraseDicomEmpty, this, &DcmImportDialog::slotParseDicomEmpty);
+    connect(this, &DcmImportDialog::sigPraseDicomCancel_Main, this, &DcmImportDialog::slotPraseDicomCancel_Main, Qt::ConnectionType::QueuedConnection);
+    connect(m_dcmInfoDialog, &DcmInfoDialog::sigPraseDicomCancel_Process, this, &DcmImportDialog::slotPraseDicomCancel_Process);
+    connect(this, &DcmImportDialog::sigParseProgressValue, m_dcmInfoDialog, &DcmInfoDialog::slotSetProcessBarValue, Qt::ConnectionType::QueuedConnection);
+    connect(this, &DcmImportDialog::sigImportAccepted, m_dcmInfoDialog, &DcmInfoDialog::slotImportAccepted, Qt::ConnectionType::QueuedConnection);
+    connect(this, &DcmImportDialog::sigImportResult, this, &DcmImportDialog::slotSetResultMode, Qt::ConnectionType::QueuedConnection);
+    connect(this, &DcmImportDialog::sigImportResultList, this, &DcmImportDialog::slotImportResultList, Qt::ConnectionType::QueuedConnection);
+    //UI
+    this->setFixedSize(890, 670);
+    this->setMainLayout(ui.verticalLayout);
+    this->setTitle(tr("导入"));
+    this->getButton(MtTemplateDialog::BtnRight1)->setText(tr("导入"));
+    this->getButton(MtTemplateDialog::BtnRight2)->setText(tr("取消"));
+    this->setAllowDrag(true);
+    ui.mtCheckBox->setText(tr("自动删除导入成功数据"));
+    ui.mtCheckBox->setChecked(true);
+    ui.mtLineEditSearchData->setPlaceholderText(tr("请输入患者姓名或ID，点击搜索图标或按下回车键开始搜索"));
+    ui.mtLineEditSearchData->setMaxLength(128);
+    //搜索
+    m_searchIconAction = new QAction(QIcon::QIcon(":/images/images/icon_zoom.png"), "");
+    ui.mtLineEditSearchData->addAction(m_searchIconAction, QLineEdit::LeadingPosition);
+    connect(m_searchIconAction, SIGNAL(triggered(bool)), this, SLOT(SlotSearchAciontTriggered(bool)));
+    //清除
+    m_clearSearchAction = new QAction(QIcon::QIcon(":/images/images/icon_clear.png"), "");
+    ui.mtLineEditSearchData->addAction(m_clearSearchAction, QLineEdit::TrailingPosition);
+    connect(m_clearSearchAction, SIGNAL(triggered(bool)), this, SLOT(SlotSearchAciontTriggered(bool)));
+    //一开始先清除X图标。有输入文字了在add进去
+    ui.mtLineEditSearchData->removeAction(m_clearSearchAction);
+    //绑定搜索框信号
+    connect(ui.mtLineEditSearchData, &QLineEdit::returnPressed, this, &DcmImportDialog::SlotSearchEditText);
+    connect(ui.mtToolButton, &QToolButton::clicked, [&]()
+    {
+        ui.mtLineEditSearchData->clear();
+        RefreshTreeWidget();
+    });
+    //有文字了再展示图标
+    connect(ui.mtLineEditSearchData, &QLineEdit::textChanged, [&]()
+    {
+        if (ui.mtLineEditSearchData->text().size() > 0)
+        {
+            ui.mtLineEditSearchData->addAction(m_clearSearchAction, QLineEdit::TrailingPosition);
+        }
+        else
+        {
+            ui.mtLineEditSearchData->removeAction(m_clearSearchAction);
+        }
+    });
+    //读取导入配置
+    readImportConfig();
+}
+void DcmImportDialog::SlotSearchAciontTriggered(bool)
+{
+    QObject* sender = this->sender();
+
+    if (m_clearSearchAction == sender)
+    {
+        //点叉清空
+        ui.mtLineEditSearchData->setText("");
+    }
+
+    SlotSearchEditText();
+}
+void DcmImportDialog::SlotSearchEditText()
+{
+    QString text = ui.mtLineEditSearchData->text();
+
+    if (text.isEmpty())
+    {
+        //只有搜索过才会还原初始状态
+        if (m_searched)
+        {
+            RefreshTreeWidget();
+            m_searched = false;
+        }
+
+        return;
+    }
+
+    m_searched = true;
+
+    for (int i = 0; i < m_remoteImportPatientInfoList.size(); ++i)
+    {
+        auto& patientData = m_remoteImportPatientInfoList[i];
+        QListWidgetItem* itemPatient = ui.listWidget_ServerPatient->item(i);
+        ImportPatientItem* itemWidget = dynamic_cast<ImportPatientItem* >(ui.listWidget_ServerPatient->itemWidget(itemPatient));
+
+        if (patientData.patientID.contains(text, Qt::CaseInsensitive) || patientData.patientName.contains(text, Qt::CaseInsensitive))
+        {
+            itemPatient->setHidden(false);
+        }
+        else
+        {
+            if (itemWidget->GetCheckStatus())
+            {
+                itemWidget->SetCheckStatus(false);
+                emit itemWidget->SigCheckStuatusChanged();
+            }
+
+            itemPatient->setHidden(true);
+        }
+    }
+}
+void DcmImportDialog::readImportConfig()
+{
+    QString ConfigFilePath = TPSFileSystemUtil::getManteiaTPSINIFilePath();
+    QSettings settings(ConfigFilePath, QSettings::IniFormat);
+    QString isSaveImportTempFile = "isSaveImportTempFile";
+
+    if (!settings.contains(isSaveImportTempFile))
+    {
+        settings.setValue(isSaveImportTempFile, 0);
+    }
+
+    int importType = settings.value(isSaveImportTempFile).toInt();
+
+    if (importType == 1)
+    {
+        m_isSaveImportTempFile = true;
+    }
+}
+void DcmImportDialog::sendImportProcess(int value)
+{
+    emit sigImportProcess(value);
+}
+void DcmImportDialog::clearLocalTree()
+{
+    clearListTreeWidget(ui.listWidget_LocalPatient);
+    clearListTreeWidget(ui.listWidget_LocalData);
+    m_localItemTreeMap.clear();
+    m_localItemDataMap.clear();
+}
+void DcmImportDialog::clearServerTree()
+{
+    clearListTreeWidget(ui.listWidget_ServerPatient);
+    clearListTreeWidget(ui.listWidget_ServerData);
+    m_serverItemTreeMap.clear();
+    m_serverItemDataMap.clear();
+}
+void DcmImportDialog::clearListTreeWidget(QListWidget* delTree)
+{
+    int counter = delTree->count();
+
+    for (int index = 0; index < counter; index++)
+    {
+        QListWidgetItem* item = delTree->takeItem(0);
+        QWidget* widget = delTree->itemWidget(item);
+        // SAFE_DELETE(widget);
+
+        if (widget)
+        {
+            widget->deleteLater();
+        }
+
+        SAFE_DELETE(item);
+    }
+}
+void DcmImportDialog::deleteRemoteImportSourceFile(QMap<QString, ImportPatientResult>& importResultMap)
+{
+    for (QMap<QString, ImportPatientResult>::iterator patientIter = importResultMap.begin(); patientIter != importResultMap.end(); ++patientIter)
+    {
+        ImportPatientResult& onePatient = patientIter.value();
+        QMap<QString, ImportStudyResult>& studyMap = onePatient.studyMap;
+
+        for (QMap<QString, ImportStudyResult>::iterator studyIter = studyMap.begin(); studyIter != studyMap.end(); ++studyIter)
+        {
+            ImportStudyResult& oneStudy = studyIter.value();
+            QMap<QString, ImportSeriesResult>& seriesMap = oneStudy.seriesMap;
+
+            for (QMap<QString, ImportSeriesResult>::iterator seriesIter = seriesMap.begin(); seriesIter != seriesMap.end(); ++seriesIter)
+            {
+                ImportSeriesResult& oneSeries = seriesIter.value();
+
+                if (oneSeries.status == IMPORT_SUCCESS)
+                {
+                    FileOperationUtils::DeletTargetFolder(oneSeries.seriesDirPath);
+                }
+
+                //rt
+                QMap<QString, ImportRTStructResult>& rtStructMap = oneSeries.rtMap;
+
+                for (QMap<QString, ImportRTStructResult>::iterator rtStructIter = rtStructMap.begin(); rtStructIter != rtStructMap.end(); ++rtStructIter)
+                {
+                    ImportRTStructResult& oneRTStruct = rtStructIter.value();
+
+                    if (oneRTStruct.status == IMPORT_SUCCESS)
+                    {
+                        FileOperationUtils::DeletTargetFolder(oneRTStruct.rtStructDirPath);
+                    }
+
+                    //plan
+                    QMap<QString, ImportRTPlanResult>& rtPlanMap = oneRTStruct.planMap;
+
+                    for (QMap<QString, ImportRTPlanResult>::iterator rtPlanIter = rtPlanMap.begin(); rtPlanIter != rtPlanMap.end(); ++rtPlanIter)
+                    {
+                        ImportRTPlanResult& oneRTPlan = rtPlanIter.value();
+
+                        if (oneRTPlan.status == IMPORT_SUCCESS)
+                        {
+                            FileOperationUtils::DeletTargetFolder(oneRTPlan.rtPlanDirPath);
+                        }
+
+                        //dose
+                        QMap<QString, ImportRTDoseResult>rtDoseMap = oneRTPlan.doseMap;
+
+                        for (QMap<QString, ImportRTDoseResult>::iterator rtDoseIter = rtDoseMap.begin(); rtDoseIter != rtDoseMap.end(); ++rtDoseIter)
+                        {
+                            ImportRTDoseResult& oneRDose = rtDoseIter.value();
+
+                            if (oneRDose.status == IMPORT_SUCCESS)
+                            {
+                                FileOperationUtils::DeletTargetFolder(oneRDose.rtDoseDirPath);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+bool DcmImportDialog::importSelectPatientJudge()
+{
+    QString warningText = tr("请确认导入的数据为正确数据!");
+
+    if (QMessageBox::StandardButton::Yes != MtMessageBox::redWarning(this, warningText))
+    {
+        return false;
+    }
+
+    return true;
+}
+bool DcmImportDialog::importJudgeOneSeriesLimit(std::map<std::string, ImportPatientData>& localPatientMap)
+{
+    QString limitTitle = tr("系统单次只允许导入单个患者的一个序列");
+    int limitSeriesCount = 1;
+    int importSeriesCount = 0;
+
+    for (std::map<std::string, ImportPatientData>::iterator iter = localPatientMap.begin(); iter != localPatientMap.end(); iter++)
+    {
+        ImportPatientData& importData = iter->second;
+        importSeriesCount += importData.getTotalSeriesCount();
+    }
+
+    if (importSeriesCount == 0)
+    {
+        MtMessageBox::NoIcon::information_Title(this,  tr("请选择要导入的序列。"));
+        return false;
+    }
+
+    if (importSeriesCount > limitSeriesCount)
+    {
+        MtMessageBox::NoIcon::information_Title(this, limitTitle, tr("请减少导入的患者或序列数量。"));
+        return false;
+    }
+
+    return true;
+}
+bool DcmImportDialog::importJudgeOneDoseLimit(std::map<std::string, ImportPatientData>& localPatientMap)
+{
+    int limitDoseCount = 1;
+
+    for (std::map<std::string, ImportPatientData>::iterator iter = localPatientMap.begin(); iter != localPatientMap.end(); iter++)
+    {
+        ImportPatientData& importData = iter->second;
+        std::map<std::string/*studyUID*/, ImportStudyData> _studyMap = importData.getStudyData();
+
+        for (auto studyIter = _studyMap.begin(); studyIter != _studyMap.end(); ++studyIter)
+        {
+            ImportStudyData& study = studyIter->second;
+            std::map<std::string/*seriesUID*/, ImportSeriesData> _seriesMap = study.getSeriesData();
+
+            for (auto iter = _seriesMap.begin(); iter != _seriesMap.end(); ++iter)
+            {
+                ImportSeriesData& series = iter->second;
+                std::map<std::string/*sopInsUID*/, ImportRtStructData> _rtStructMap = series.getRtStructData();
+
+                for (auto rtIter = _rtStructMap.begin(); rtIter != _rtStructMap.end(); ++rtIter)
+                {
+                    ImportRtStructData& oneRt = rtIter->second;
+                    std::map<std::string/*sopInsUID*/, ImportRtPlanData> _rtPlanMap = oneRt.getRtPlanData();
+
+                    for (auto planIter = _rtPlanMap.begin(); planIter != _rtPlanMap.end(); ++planIter)
+                    {
+                        ImportRtPlanData& onePlan = planIter->second;
+                        std::map<std::string/*sopInsUID*/, ImportRtDoseData> _rtDoseMap = onePlan.getRtDoseData();
+
+                        if (_rtDoseMap.size() > limitDoseCount)
+                        {
+                            MtMessageBox::NoIcon::information_Title(this, tr("系统单次只允许导入计划下的一个剂量文件"), tr("请减少导入的剂量文件数量。"));
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return true;
+}
+bool DcmImportDialog::importJudgeImageLimit(std::map<std::string, ImportPatientData>& localPatientMap)
+{
+    QMap<QString/*patientID*/, LimitImportInfo> limitImageMap;
+
+    for (std::map<std::string, ImportPatientData>::iterator iter = localPatientMap.begin(); iter != localPatientMap.end(); iter++)
+    {
+        QString onePatientID = iter->first.c_str();
+        ImportPatientData& importData = iter->second;
+        std::map<std::string/*studyUID*/, ImportStudyData> _studyMap = importData.getStudyData();
+        int totalSeriesSize = 0;
+
+        for (auto studyIter = _studyMap.begin(); studyIter != _studyMap.end(); ++studyIter)
+        {
+            ImportStudyData& study = studyIter->second;
+            std::map<std::string/*seriesUID*/, ImportSeriesData> _seriesMap = study.getSeriesData();
+            totalSeriesSize += _seriesMap.size();
+        }
+
+        //查询这个患者所在的series有多少
+        QVariantList outSeriesList;
+        int errNo;
+        QString errMsg;
+        bool isOK = PMBusinessModel::getInstance()->getDBBusinessModel()->findTableDataOneCondition(TableID_E::TableID_Series, MenberType::PatientID,
+                    onePatientID, outSeriesList, errNo, errMsg);
+
+        if (isOK == false)
+        {
+            MtMessageBox::yellowWarning(this, tr("连接数据库失败！"));
+            return false;
+        }
+
+        if (totalSeriesSize + outSeriesList.size() > 100)   //测试代码，改成100
+        {
+            int leftImage = 10 - outSeriesList.size();
+
+            if (leftImage < 0)
+            {
+                leftImage = 0;
+            }
+
+            LimitImportInfo limitInfo;
+            limitInfo.leftNumber = leftImage;
+            limitInfo.currentNumber = totalSeriesSize;
+            limitImageMap.insert(onePatientID, limitInfo);
+        }
+    }
+
+    if (limitImageMap.size() > 0)
+    {
+        QString outLimitMsg;
+
+        //打印出所有的患者
+        for (auto iter = limitImageMap.begin(); iter != limitImageMap.end(); ++iter)
+        {
+            LimitImportInfo limitInfo = iter.value();
+            QString tempMsg = tr("[ID:%1,剩余可导:%2,本次导入:%3]").arg(iter.key()).arg(QString::number(limitInfo.leftNumber)).arg(QString::number(limitInfo.currentNumber));
+
+            if (outLimitMsg.isEmpty())
+            {
+                outLimitMsg += tempMsg;
+            }
+            else
+            {
+                outLimitMsg += "\n" + tempMsg;
+            }
+        }
+
+        QString title = tr("单个患者系统最多导入10个序列,以下患者不符合要求。");
+        MtMessageBox::NoIcon::information_Title(this, title, outLimitMsg);
+        return false;
+    }
+
+    return true;
+}
+bool DcmImportDialog::importJudgePatientOpened(std::map<std::string, ImportPatientData>& localPatientMap)
+{
+    std::map<std::string, ImportPatientData>::const_iterator cosnt_iter = localPatientMap.begin();
+
+    for (; cosnt_iter != localPatientMap.end(); ++cosnt_iter)
+    {
+        std::string onePatientID = cosnt_iter->first;
+        QString errMsg;
+
+        if (PMBusinessModel::getInstance()->ServerOpt_CheckPatientIsOpened(onePatientID.c_str(), errMsg) == false)
+        {
+            MtMessageBox::NoIcon::information_Title(this, errMsg);
+            return false;
+        }
+    }
+
+    return true;
+}
+#include "Service\MTIODicomService\vtkDicomInfo.h"
+#include<exception>
+void DcmImportDialog::importJudgeImageNormalType(std::map<std::string, ImportPatientData>& localPatientMap)
+{
+    DcmAllInfo  allInfo;
+    bool isFindDicomInfo = false;
+
+    for (std::map<std::string, ImportPatientData>::iterator iter = localPatientMap.begin(); iter != localPatientMap.end(); iter++)
+    {
+        ImportPatientData& importData = iter->second;
+
+        if ((isFindDicomInfo = importData.getFirstImageInfo(allInfo)) == true)
+        {
+            break;
+        }
+    }
+
+    if (isFindDicomInfo == false)
+    {
+        emit sigCheckImageType(false, false, tr("获取图像体位信息失败"), localPatientMap);
+        return;
+    }
+
+    PMBusinessModel::getInstance()->ShowLoadingDialog(tr("图像数据校验中..."));
+    mtcore::MTTask task = [&, allInfo, localPatientMap]
+    {
+        QString seriesTempUID = allInfo.seriesUID.c_str();
+        //中文路径获取会乱码
+        QString tempCTPath = QString::fromLocal8Bit(allInfo.filePath.c_str());//解决中文路径
+        QString seriesDir = FileOperationUtils::GetFileExistDir(tempCTPath);
+        QString seriesPosition = allInfo.patientPositon.c_str();
+        //判断图像是否正常。现在申证只允许导入一个图像。所以只要判断一个就可以了
+        vtkDicomInfo dicomInfo(1);
+        int ctIndex = -1;
+#ifdef Debug_Log
+        qDebug() << "start:dicomInfo.LoadCtImage: " << seriesDir.toStdString() << seriesTempUID.toStdString();
+#endif
+
+        try
+        {
+            ctIndex = dicomInfo.LoadCtImage(seriesDir.toStdString(), seriesTempUID.toStdString());
+        }
+        catch (std::exception e)
+        {
+#ifdef Debug_Log
+            qDebug() << "loaddicomInfoFailed" << e.what();
+#endif
+        }
+
+#ifdef Debug_Log
+        qDebug() << "end:dicomInfo.LoadCtImage: ";
+#endif
+
+
+        if (ctIndex < 0)
+        {
+            emit sigCheckImageType(false, false, tr("解析图像数据失败"), localPatientMap);
+            return;
+        }
+
+        QString imageDescrition = tr("当前导入%1").arg(allInfo.modality.c_str());// QString("%1 Serires UID:%2,").arg(allInfo.modality.c_str()).arg(seriesTempUID);
+        QString errTypeMsg;
+        vtkDicomInfo::CTType ctType = dicomInfo.getCTType();
+
+        if (ctType != vtkDicomInfo::CTType::STANDARDCT)
+        {
+            //如果是非HFS也算标准数据，现在支持非HFS了。只记录一下字段体位方便后面追查
+            if (ctType == vtkDicomInfo::CTType::NORMAL_UNHFS)
+            {
+                ctType = vtkDicomInfo::CTType::STANDARDCT;
+            }
+            else
+            {
+                QMap<vtkDicomInfo::CTType, QString> ctUnNormalMap;
+                ctUnNormalMap.insert(vtkDicomInfo::CTType::UNKNOWCT, tr("图像为非标准数据"));
+                ctUnNormalMap.insert(vtkDicomInfo::CTType::UNEVENCT, tr("图像层厚不一致"));
+                ctUnNormalMap.insert(vtkDicomInfo::CTType::LACKCT, tr("图像文件缺层"));
+                ctUnNormalMap.insert(vtkDicomInfo::CTType::OBLIQUECT, tr("图像倾斜"));
+                //ctUnNormalMap.insert(vtkDicomInfo::CTType::NORMAL_UNHFS, tr("图像非HFS"));
+                errTypeMsg = ctUnNormalMap.value(ctType);
+            }
+        }
+
+        //if (seriesPosition != PATIENTPOS_HFS)
+        //{
+        //    errTypeMsg.size() > 0 ? errTypeMsg += "," : 0;//已经有了就加起来
+        //    errTypeMsg += tr("图像体位为%1(非%2体位)")
+        //                  .arg(PMBusinessModel::getInstance()->GetPatientPositionFullString(seriesPosition))
+        //                  .arg(PMBusinessModel::getInstance()->GetPatientPositionFullString(PATIENTPOS_HFS));
+        //}
+
+        m_imageTypeMap.clear();
+        m_imageTypeMap.insert(seriesTempUID, ctType);
+
+        if (errTypeMsg.size() > 0)
+        {
+            errTypeMsg = imageDescrition + errTypeMsg;
+            errTypeMsg += tr(",无法用于计划设计");
+            emit sigCheckImageType(true, false, errTypeMsg, localPatientMap);
+            return;
+        }
+
+        emit sigCheckImageType(true, true, tr(""), localPatientMap);
+
+
+    };
+    PMBusinessModel::getInstance()->GetMTContext()->AddTask(task);
+}
+#include "vtkOutputWindow.h"
+#include "itkTextOutput.h"
+#include "vtkFileOutputWindow.h"
+void DcmImportDialog::initVTKOutputLog()
+{
+    vtkSmartPointer<vtkFileOutputWindow> fileOutputWindow = vtkSmartPointer<vtkFileOutputWindow>::New();
+    QString logPath = TPSFileSystemUtil::getTPSTempDir() + "vtkoutputTpsAssistant.log";
+    fileOutputWindow->SetFileName(logPath.toLocal8Bit());
+    vtkOutputWindow::SetInstance(fileOutputWindow);
+    itk::OutputWindow::SetInstance(itk::TextOutput::New());
+}
+void DcmImportDialog::reflashLocalTree(std::map<std::string, ImportPatientData>& localPatientMap)
+{
+    for (std::map<std::string, ImportPatientData>::iterator iter = localPatientMap.begin(); iter != localPatientMap.end(); iter++)
+    {
+        ImportPatientData importData = iter->second;
+        //item
+        ImportPatientItem* item = new ImportPatientItem;
+        connect(item, &ImportPatientItem::SigCheckStuatusChanged, this, &DcmImportDialog::slotLocalPatientChanged);
+        item->SetPatientID(importData.getPatientInfo().getPatientID().c_str());
+        item->SetPatientName(importData.getPatientInfo().getPatientName().c_str());
+        m_localItemDataMap.insert(item, importData);
+        //插入患者列表item
+        QListWidgetItem* listiItem = new QListWidgetItem(ui.listWidget_LocalPatient);
+        listiItem->setSizeHint(QSize(ui.listWidget_LocalPatient->width() - 6, 36));
+        ui.listWidget_LocalPatient->addItem(listiItem);
+        ui.listWidget_LocalPatient->setItemWidget(listiItem, item);
+    }
+}
+void DcmImportDialog::reflashServerTree()
+{
+    QString serverIP;
+    int serverPort;
+    QString clientID;
+    QString tempMsg;
+
+    if (PMBusinessModel::getInstance()->GetServerIPAndPort_ClientID(serverIP, serverPort, clientID, tempMsg) == false)
+    {
+        MtMessageBox::yellowWarning(this, "获取服务端信息失败！");
+        return;
+    }
+
+    //1.获取第三方导入文件夹
+    mtrpccommon::ST_MTRPC_REQ_GetDicomDir query;
+    query.method = "GetTPSDicomRemoteImportDir";
+    //发送数据
+    std::string responseStr;
+    std::string errMsgStr;
+    mtrpc::RpcTcpClient client(serverIP.toStdString(), serverPort);
+    std::string tmp;
+    int ret = client.InitClient(tmp);
+
+    if (ret != 0)
+    {
+        MtMessageBox::yellowWarning(this, QString(tr("RpcTcpClient初始化失败！")));
+        return;
+    }
+
+    client.SetRpcTimeout(3000);
+    //请求导入
+    ret = client.RpcMethod(query.ConvertJson(), responseStr, errMsgStr);
+    //响应结构体
+    mtrpccommon::ST_MTRPC_RES_GetDicomDir response;
+    response.ConvertData(responseStr);
+
+    if (response.error.code != 0)
+    {
+        MtMessageBox::yellowWarning(this, QString(tr("获取服务端共享目录失败！")) + response.error.message.c_str());
+    }
+
+    QString remoteServerDir = response.dir.c_str();
+
+    if (remoteServerDir.isEmpty())
+    {
+        MtMessageBox::yellowWarning(this, QString(tr("获取服务端共享目录失败！")) + errMsgStr.c_str());
+        return;
+    }
+
+    QList<QString> importDirList = FileOperationUtils::GetFolderPathList(remoteServerDir, true);
+
+    for (QString onePatientDirPath : importDirList)
+    {
+        QString onePatientIni = onePatientDirPath + "baseinfo.ini";
+        QSettings iniset(onePatientIni, QSettings::IniFormat);
+        iniset.setIniCodec("UTF-8");
+        QString onePatientID = iniset.value("patientID").toString();
+        QString onePatientName = iniset.value("patientName").toString();
+        QList<QString>fileCount = FileOperationUtils::GetFolderPathList(onePatientDirPath + "Series/");
+
+        if (onePatientID.isEmpty() || fileCount.size() == 0)
+        {
+            continue;
+        }
+
+        //item
+        ImportPatientItem* item = new ImportPatientItem;
+        connect(item, &ImportPatientItem::SigCheckStuatusChanged, this, &DcmImportDialog::slotServerPatientChanged);
+        item->SetPatientID(onePatientID);
+        item->SetPatientName(onePatientName);
+        //获取远程主机名。拼接当前目录
+        item->SetPatientDirPath(onePatientDirPath);
+        DcmImportDialog::ST_OneRemoteImportPatientInfo patientInfo;
+        patientInfo.patientID = onePatientID;
+        patientInfo.patientName = onePatientName;
+        m_remoteImportPatientInfoList.append(patientInfo);
+        //插入患者列表item
+        QListWidgetItem* listiItem = new QListWidgetItem(ui.listWidget_ServerPatient);
+        listiItem->setSizeHint(QSize(ui.listWidget_ServerPatient->width() - 6, 36));
+        ui.listWidget_ServerPatient->addItem(listiItem);
+        ui.listWidget_ServerPatient->setItemWidget(listiItem, item);
+    }
+}
+void DcmImportDialog::slotParseDicomEmpty()
+{
+    m_dcmInfoDialog->closeDialog();
+    MtMessageBox::NoIcon::information_Title(this, tr("未检索到有效DICOM文件。"));
+    ui.lineEdit_search->clear();
+    return;
+}
+#include <thread>
+void DcmImportDialog::slotPraseDicomCancel_Process()
+{
+    m_dcmInfoDialog->setProcessMsg(tr("取消检索中..."));
+    PMBusinessModel::getInstance()->setParseDicomCancel();
+}
+void DcmImportDialog::slotPraseDicomCancel_Main()
+{
+    m_dcmInfoDialog->closeDialog();
+}
