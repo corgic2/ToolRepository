@@ -12,7 +12,13 @@ Widget::Widget(QWidget *parent) :
     InitDiractory();
     InitModel();
     InitView();
-
+    QString stylestr = "QTreeView::branch:closed:has-children:!has-siblings,\
+                                                          QTreeView::branch:closed:has-children:has-siblings\
+                                                          {background-color:rgba(212,212,212,0.5);}\
+                                                         QTreeView::branch:open:has-children:!has-siblings,\
+                                                         QTreeView::branch:open:has-children:has-siblings\
+                                                         {background-color:rgba(212,212,212,1);}";
+    ui->treeView->setStyleSheet(stylestr);
 
     ui->lineEditDir->setEnabled(false);
     connect(ui->pushButton,&QPushButton::clicked,this,&Widget::SlotGetFilePath);
